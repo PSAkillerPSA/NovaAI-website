@@ -4,32 +4,42 @@ import operator
 import os
 import re
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote
 
+from flask import Flask, Response, jsonify, render_template_string, request, stream_with_context
 from gpt4all import GPT4All
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 HOST = "0.0.0.0"
-
-# FeatherPanel/Quaxly usually provides PORT.
-# Fall back to 8000 if it doesn't.
 PORT = int(os.environ.get("PORT", "8000"))
-
-MODEL_NAME = "orca-mini-3b-gguf2-q4_0.gguf"
-
-# Prevent multiple simultaneous generations from fighting
-# over the same local GPT4All model.
+MODEL_PATH = os.environ.get("MODEL_PATH") or os.environ.get("MODEL_NAME") or "orca-mini-3b-gguf2-q4_0.gguf"
 MODEL_LOCK = threading.Lock()
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "500"))
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.2"))
+MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "8"))
 
 
-# ============================================================
-# SAFE CALCULATOR
-# ============================================================
+def resolve_model_path(model_name):
+    candidate = os.path.expanduser(model_name).strip()
+    if not candidate:
+        return None
+
+    if os.path.isfile(candidate):
+        return candidate
+
+    candidates = [
+        os.path.join(os.getcwd(), candidate),
+        os.path.join(os.getcwd(), "models", candidate),
+        os.path.join("/", "models", candidate),
+        os.path.join("/", "workspace", candidate),
+    ]
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    return candidate
+
 
 OPERATORS = {
     ast.Add: operator.add,
@@ -50,24 +60,18 @@ def safe_eval(node):
 
     if isinstance(node, ast.BinOp):
         operation = OPERATORS.get(type(node.op))
-
         if operation is None:
             raise ValueError("Unsupported operator")
-
         return operation(
             safe_eval(node.left),
-            safe_eval(node.right)
+            safe_eval(node.right),
         )
 
     if isinstance(node, ast.UnaryOp):
         operation = OPERATORS.get(type(node.op))
-
         if operation is None:
             raise ValueError("Unsupported operator")
-
-        return operation(
-            safe_eval(node.operand)
-        )
+        return operation(safe_eval(node.operand))
 
     raise ValueError("Unsupported expression")
 
@@ -75,30 +79,14 @@ def safe_eval(node):
 def calculate(expression):
     try:
         expression = expression.replace("^", "**")
-
-        tree = ast.parse(
-            expression,
-            mode="eval"
-        )
-
-        return str(
-            safe_eval(tree.body)
-        )
-
+        tree = ast.parse(expression, mode="eval")
+        return str(safe_eval(tree.body))
     except Exception as exc:
         return f"Calculator error: {exc}"
 
 
-# ============================================================
-# IMAGE GENERATION
-# ============================================================
-
 def make_image_url(prompt):
-    encoded_prompt = quote(
-        prompt,
-        safe=""
-    )
-
+    encoded_prompt = quote(prompt, safe="")
     return (
         "https://image.pollinations.ai/prompt/"
         + encoded_prompt
@@ -107,41 +95,6 @@ def make_image_url(prompt):
         + "&nologo=true"
     )
 
-
-# ============================================================
-# PYTHON VALIDATION
-# ============================================================
-
-def validate_python(code):
-    forbidden = [
-        "open(",
-        "os.remove",
-        "os.unlink",
-        "os.rename",
-        "shutil.",
-        "socket.",
-        "requests.post",
-        "requests.put",
-        "requests.delete",
-        "urllib.request.urlopen",
-    ]
-
-    lowered = code.lower()
-
-    for item in forbidden:
-        if item.lower() in lowered:
-            return (
-                False,
-                "Preview blocked because the script contains "
-                f"a restricted operation: {item}"
-            )
-
-    return True, ""
-
-
-# ============================================================
-# NOVA AI
-# ============================================================
 
 SYSTEM_PROMPT = """
 You are Nova AI, a helpful local AI assistant.
@@ -173,42 +126,35 @@ Do not say that you cannot create Python scripts.
 
 
 class NovaAgent:
-
     def __init__(self):
-        print("Loading Nova AI model...")
+        resolved_path = resolve_model_path(MODEL_PATH)
+        if resolved_path is None or not os.path.isfile(resolved_path):
+            raise FileNotFoundError(
+                "Model file not found. Set MODEL_PATH to a valid .gguf file path or upload the model into the workspace. "
+                f"Tried: {MODEL_PATH}"
+            )
 
-        self.model = GPT4All(
-            MODEL_NAME
-        )
-
+        print(f"Loading Nova AI model from {resolved_path}...")
+        self.model = GPT4All(resolved_path)
         print("Nova AI model loaded!")
-
 
     def wants_image(self, text):
         text = text.lower()
-
         phrases = [
             "generate an image",
             "generate image",
             "create an image",
             "make an image",
             "draw an image",
-
             "generate a picture",
             "create a picture",
             "make a picture",
-
             "generate a logo",
             "create a logo",
             "make a logo",
             "draw a logo",
         ]
-
-        return any(
-            phrase in text
-            for phrase in phrases
-        )
-
+        return any(phrase in text for phrase in phrases)
 
     def extract_image_prompt(self, text):
         patterns = [
@@ -216,11 +162,9 @@ class NovaAgent:
             r"create\s+(?:an?\s+)?image\s*(?:of|for)?\s*",
             r"make\s+(?:an?\s+)?image\s*(?:of|for)?\s*",
             r"draw\s+(?:an?\s+)?image\s*(?:of|for)?\s*",
-
             r"generate\s+(?:an?\s+)?picture\s*(?:of|for)?\s*",
             r"create\s+(?:an?\s+)?picture\s*(?:of|for)?\s*",
             r"make\s+(?:an?\s+)?picture\s*(?:of|for)?\s*",
-
             r"generate\s+(?:a\s+)?logo\s*(?:of|for)?\s*",
             r"create\s+(?:a\s+)?logo\s*(?:of|for)?\s*",
             r"make\s+(?:a\s+)?logo\s*(?:of|for)?\s*",
@@ -228,656 +172,417 @@ class NovaAgent:
         ]
 
         prompt = text.strip()
-
         for pattern in patterns:
-
-            new_prompt = re.sub(
-                pattern,
-                "",
-                prompt,
-                count=1,
-                flags=re.IGNORECASE
-            )
-
+            new_prompt = re.sub(pattern, "", prompt, count=1, flags=re.IGNORECASE)
             if new_prompt != prompt:
                 prompt = new_prompt
                 break
-
-        return (
-            prompt.strip()
-            or text.strip()
-        )
-
+        return prompt.strip() or text.strip()
 
     def extract_math(self, text):
         match = re.search(
-            r"(?:calculate|compute|what is)\s+"
-            r"([0-9+\-*/().%^ ]+)",
+            r"(?:calculate|compute|what is)\s+([0-9+\-*/().%^ ]+)",
             text,
-            re.IGNORECASE
+            re.IGNORECASE,
         )
-
         if not match:
             return None
 
         expression = match.group(1).strip()
-
-        if re.fullmatch(
-            r"[0-9+\-*/().%^ ]+",
-            expression
-        ):
+        if re.fullmatch(r"[0-9+\-*/().%^ ]+", expression):
             return expression
-
         return None
 
-
     def chat(self, conversation):
-
         latest_user_message = ""
-
         for role, message in reversed(conversation):
-
             if role == "user":
                 latest_user_message = message
                 break
 
-
-        # ----------------------------------------------------
-        # IMAGE REQUEST
-        # ----------------------------------------------------
-
-        if self.wants_image(
-            latest_user_message
-        ):
-
-            prompt = self.extract_image_prompt(
-                latest_user_message
-            )
-
+        if self.wants_image(latest_user_message):
+            prompt = self.extract_image_prompt(latest_user_message)
             return f"[IMAGE: {prompt}]"
 
-
-        # ----------------------------------------------------
-        # CALCULATOR
-        # ----------------------------------------------------
-
         tool_information = ""
-
-        expression = self.extract_math(
-            latest_user_message
-        )
-
+        expression = self.extract_math(latest_user_message)
         if expression:
+            result = calculate(expression)
+            tool_information += f"\n\nCalculator result:\n{expression} = {result}\n"
 
-            result = calculate(
-                expression
-            )
-
-            tool_information += (
-                "\n\nCalculator result:\n"
-                f"{expression} = {result}\n"
-            )
-
-
-        # ----------------------------------------------------
-        # BUILD PROMPT
-        # ----------------------------------------------------
-
-        prompt = SYSTEM_PROMPT
-
-        prompt += "\n\nConversation:\n"
-
-
-        # Keep the same 30-message limit
-        # as the original NovaAI6.
-        for role, message in conversation[-30:]:
-
-            name = (
-                "User"
-                if role == "user"
-                else "Nova"
-            )
-
-            prompt += (
-                f"{name}: {message}\n"
-            )
-
+        prompt = SYSTEM_PROMPT + "\n\nConversation:\n"
+        recent_conversation = conversation[-MAX_HISTORY_MESSAGES:]
+        for role, message in recent_conversation:
+            name = "User" if role == "user" else "Nova"
+            prompt += f"{name}: {message}\n"
 
         if tool_information:
             prompt += tool_information
 
-
         prompt += "\nNova:"
 
-
-        # ----------------------------------------------------
-        # GENERATE
-        # ----------------------------------------------------
-
         try:
-
             with MODEL_LOCK:
-
                 result = self.model.generate(
                     prompt,
-                    max_tokens=1500,
-                    temp=0.3
+                    max_tokens=MAX_TOKENS,
+                    temp=TEMPERATURE,
                 )
-
             return result.strip()
-
         except Exception as exc:
+            return "Nova encountered an error:\n" + str(exc)
 
-            return (
-                "Nova encountered an error:\n"
-                + str(exc)
-            )
-
-
-# ============================================================
-# LOAD NOVA
-# ============================================================
 
 try:
-
     NOVA = NovaAgent()
-
 except Exception as exc:
-
     NOVA = None
-
-    print(
-        "FAILED TO LOAD NOVA:"
-    )
-
-    print(
-        str(exc)
-    )
+    print("FAILED TO LOAD NOVA:")
+    print(str(exc))
 
 
-# ============================================================
-# HTTP SERVER
-# ============================================================
-
-class NovaRequestHandler(BaseHTTPRequestHandler):
+app = Flask(__name__)
 
 
-    def log_message(
-        self,
-        format,
-        *args
-    ):
-        print(
-            f"[HTTP] {self.address_string()} "
-            + format % args
-        )
-
-
-    def send_json(
-        self,
-        status,
-        data
-    ):
-
-        body = json.dumps(
-            data,
-            ensure_ascii=False
-        ).encode("utf-8")
-
-
-        self.send_response(
-            status
-        )
-
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8"
-        )
-
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
-
-        # Allow your website to communicate
-        # with the Quaxly API.
-        self.send_header(
-            "Access-Control-Allow-Origin",
-            "*"
-        )
-
-        self.send_header(
-            "Access-Control-Allow-Methods",
-            "POST, GET, OPTIONS"
-        )
-
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Content-Type"
-        )
-
-        self.end_headers()
-
-        self.wfile.write(
-            body
-        )
-
-
-    def do_OPTIONS(self):
-
-        self.send_response(
-            204
-        )
-
-        self.send_header(
-            "Access-Control-Allow-Origin",
-            "*"
-        )
-
-        self.send_header(
-            "Access-Control-Allow-Methods",
-            "POST, GET, OPTIONS"
-        )
-
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Content-Type"
-        )
-
-        self.end_headers()
-
-
-    def do_GET(self):
-
-        if self.path == "/":
-
-            self.send_json(
-                200,
-                {
-                    "name": "Nova AI",
-                    "status": "online",
-                    "service": "NovaAI API"
-                }
-            )
-
-            return
-
-
-        if self.path == "/health":
-
-            self.send_json(
-                200,
-                {
-                    "status": "ok",
-                    "nova_loaded": NOVA is not None
-                }
-            )
-
-            return
-
-
-        self.send_json(
-            404,
-            {
-                "error": "Not found"
+@app.get("/")
+def index():
+    return render_template_string("""
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Nova AI</title>
+        <style>
+            :root {
+                --bg: #0b1020;
+                --panel: #121a2b;
+                --panel-2: #1b2438;
+                --text: #edf2ff;
+                --muted: #a9b7d2;
+                --accent: #7cc7ff;
+                --accent-2: #7ef0c9;
+                --border: #2a3853;
             }
-        )
-
-
-    def do_POST(self):
-
-        if self.path != "/chat":
-
-            self.send_json(
-                404,
-                {
-                    "error": "Not found"
-                }
-            )
-
-            return
-
-
-        try:
-
-            content_length = int(
-                self.headers.get(
-                    "Content-Length",
-                    "0"
-                )
-            )
-
-        except ValueError:
-
-            self.send_json(
-                400,
-                {
-                    "error": "Invalid Content-Length"
-                }
-            )
-
-            return
-
-
-        if content_length <= 0:
-
-            self.send_json(
-                400,
-                {
-                    "error": "Empty request body"
-                }
-            )
-
-            return
-
-
-        try:
-
-            raw_body = self.rfile.read(
-                content_length
-            )
-
-            data = json.loads(
-                raw_body.decode("utf-8")
-            )
-
-        except Exception as exc:
-
-            self.send_json(
-                400,
-                {
-                    "error": (
-                        "Invalid JSON: "
-                        + str(exc)
-                    )
-                }
-            )
-
-            return
-
-
-        if NOVA is None:
-
-            self.send_json(
-                503,
-                {
-                    "error": "Nova AI model is not loaded."
-                }
-            )
-
-            return
-
-
-        # ----------------------------------------------------
-        # ACCEPT EITHER:
-        #
-        # {
-        #   "message": "Hello"
-        # }
-        #
-        # OR:
-        #
-        # {
-        #   "conversation": [
-        #       ["user", "Hello"]
-        #   ]
-        # }
-        # ----------------------------------------------------
-
-        conversation = data.get(
-            "conversation"
-        )
-
-
-        if conversation is None:
-
-            message = data.get(
-                "message"
-            )
-
-            if not isinstance(
-                message,
-                str
-            ):
-
-                self.send_json(
-                    400,
-                    {
-                        "error":
-                        "Missing 'message' or 'conversation'"
-                    }
-                )
-
-                return
-
-
-            conversation = [
-                (
-                    "user",
-                    message
-                )
-            ]
-
-
-        # Convert JSON arrays into tuples.
-        cleaned_conversation = []
-
-        if not isinstance(
-            conversation,
-            list
-        ):
-
-            self.send_json(
-                400,
-                {
-                    "error":
-                    "'conversation' must be a list"
-                }
-            )
-
-            return
-
-
-        for item in conversation:
-
-            if (
-                not isinstance(
-                    item,
-                    (list, tuple)
-                )
-                or len(item) != 2
-            ):
-
-                self.send_json(
-                    400,
-                    {
-                        "error":
-                        "Each conversation item "
-                        "must contain role and message"
-                    }
-                )
-
-                return
-
-
-            role = str(
-                item[0]
-            )
-
-            message = str(
-                item[1]
-            )
-
-
-            if role not in (
-                "user",
-                "assistant"
-            ):
-
-                self.send_json(
-                    400,
-                    {
-                        "error":
-                        "Role must be "
-                        "'user' or 'assistant'"
-                    }
-                )
-
-                return
-
-
-            cleaned_conversation.append(
-                (
-                    role,
-                    message
-                )
-            )
-
-
-        if not cleaned_conversation:
-
-            self.send_json(
-                400,
-                {
-                    "error":
-                    "Conversation is empty"
-                }
-            )
-
-            return
-
-
-        print(
-            "Nova received:",
-            cleaned_conversation[-1][1]
-        )
-
-
-        # ----------------------------------------------------
-        # RUN NOVA
-        # ----------------------------------------------------
-
-        try:
-
-            response = NOVA.chat(
-                cleaned_conversation
-            )
-
-        except Exception as exc:
-
-            self.send_json(
-                500,
-                {
-                    "error":
-                    str(exc)
-                }
-            )
-
-            return
-
-
-        # ----------------------------------------------------
-        # IMAGE RESPONSE
-        # ----------------------------------------------------
-
-        image_match = re.search(
-            r"\[IMAGE:\s*(.*?)\]",
-            response,
-            re.DOTALL
-        )
-
-
-        if image_match:
-
-            prompt = (
-                image_match
-                .group(1)
-                .strip()
-            )
-
-            image_url = make_image_url(
-                prompt
-            )
-
-            self.send_json(
-                200,
-                {
-                    "response": response,
-                    "type": "image",
-                    "prompt": prompt,
-                    "image_url": image_url
-                }
-            )
-
-            return
-
-
-        # ----------------------------------------------------
-        # NORMAL RESPONSE
-        # ----------------------------------------------------
-
-        self.send_json(
-            200,
-            {
-                "response": response,
-                "type": "text"
+            * { box-sizing: border-box; }
+            body {
+                margin: 0;
+                background: var(--bg);
+                color: var(--text);
+                font-family: Arial, sans-serif;
             }
-        )
+            .wrap {
+                max-width: 980px;
+                margin: 32px auto;
+                padding: 20px;
+            }
+            .panel {
+                background: var(--panel);
+                border: 1px solid var(--border);
+                border-radius: 14px;
+                padding: 18px;
+                box-shadow: 0 16px 40px rgba(0,0,0,0.25);
+            }
+            h1 {
+                margin: 0 0 10px;
+                font-size: 2rem;
+            }
+            .status {
+                color: var(--muted);
+                margin-bottom: 14px;
+            }
+            textarea {
+                width: 100%;
+                min-height: 120px;
+                background: var(--panel-2);
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                color: var(--text);
+                padding: 14px;
+                font-size: 1rem;
+                resize: vertical;
+            }
+            .row {
+                display: flex;
+                gap: 12px;
+                margin-top: 16px;
+                flex-wrap: wrap;
+            }
+            button {
+                background: linear-gradient(135deg, var(--accent), var(--accent-2));
+                color: #08111d;
+                border: none;
+                border-radius: 10px;
+                padding: 12px 18px;
+                font-weight: 700;
+                cursor: pointer;
+            }
+            button.secondary {
+                background: transparent;
+                color: var(--text);
+                border: 1px solid var(--border);
+            }
+            .chat {
+                margin-top: 24px;
+                display: flex;
+                flex-direction: column;
+                gap: 16px;
+            }
+            .bubble {
+                background: var(--panel-2);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 14px 16px;
+                white-space: pre-wrap;
+                line-height: 1.5;
+            }
+            .bubble.user {
+                background: #172236;
+            }
+            .bubble img {
+                display: block;
+                max-width: 100%;
+                border-radius: 12px;
+                margin-top: 10px;
+                border: 1px solid var(--border);
+            }
+            .loading {
+                color: var(--muted);
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                font-size: 0.9rem;
+            }
+            .typing-dots {
+                display: inline-flex;
+                gap: 4px;
+                align-items: center;
+                height: 16px;
+            }
+            .typing-dots span {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                background: var(--accent);
+                display: block;
+                animation: bounce 1.2s infinite ease-in-out;
+            }
+            .typing-dots span:nth-child(2) { animation-delay: 0.15s; }
+            .typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+            @keyframes bounce {
+                0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+                40% { transform: translateY(-4px); opacity: 1; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="panel">
+                <h1>Nova AI</h1>
+                <div class="status" id="status">Ready</div>
+                <textarea id="prompt" placeholder="Ask Nova AI anything...">Hello</textarea>
+                <div class="row">
+                    <button id="sendBtn">Send</button>
+                    <button class="secondary" id="clearBtn" type="button">Clear</button>
+                </div>
+            </div>
+
+            <div class="chat" id="chat"></div>
+        </div>
+
+        <script>
+            const chat = document.getElementById('chat');
+            const prompt = document.getElementById('prompt');
+            const status = document.getElementById('status');
+            const sendBtn = document.getElementById('sendBtn');
+            const clearBtn = document.getElementById('clearBtn');
+
+            const history = [];
+
+            function addBubble(role, text) {
+                const el = document.createElement('div');
+                el.className = 'bubble ' + role;
+                el.textContent = text;
+                chat.appendChild(el);
+                window.scrollTo(0, document.body.scrollHeight);
+                return el;
+            }
+
+            function addImage(url, altText) {
+                const el = document.createElement('div');
+                el.className = 'bubble';
+                const img = document.createElement('img');
+                img.src = url;
+                img.alt = altText;
+                el.appendChild(img);
+                chat.appendChild(el);
+                window.scrollTo(0, document.body.scrollHeight);
+            }
+
+            function createLoadingBubble() {
+                const el = document.createElement('div');
+                el.className = 'bubble assistant';
+                const loader = document.createElement('div');
+                loader.className = 'loading';
+                loader.innerHTML = '<span>Writing</span><span class="typing-dots"><span></span><span></span><span></span></span>';
+                el.appendChild(loader);
+                chat.appendChild(el);
+                window.scrollTo(0, document.body.scrollHeight);
+                return el;
+            }
+
+            function typeTextIntoBubble(el, text) {
+                el.textContent = '';
+                let i = 0;
+                const interval = setInterval(() => {
+                    if (i >= text.length) {
+                        clearInterval(interval);
+                        status.textContent = 'Ready';
+                        sendBtn.disabled = false;
+                        prompt.focus();
+                        return;
+                    }
+
+                    el.textContent += text[i];
+                    i += 1;
+                    window.scrollTo(0, document.body.scrollHeight);
+                }, 18);
+            }
+
+            async function sendMessage() {
+                const text = prompt.value.trim();
+                if (!text) return;
+
+                history.push(['user', text]);
+                addBubble('user', text);
+                prompt.value = '';
+                status.textContent = 'Thinking...';
+                sendBtn.disabled = true;
+
+                const typingBubble = createLoadingBubble();
+
+                try {
+                    const response = await fetch('/api/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ conversation: history })
+                    });
+
+                    const data = await response.json();
+
+                    if (!response.ok) {
+                        throw new Error(data.error || 'Request failed');
+                    }
+
+                    if (data.type === 'image') {
+                        typingBubble.remove();
+                        addBubble('assistant', data.prompt || 'Generated image');
+                        addImage(data.image_url, data.prompt || 'Generated image');
+                        history.push(['assistant', data.response || '']);
+                        status.textContent = 'Ready';
+                        sendBtn.disabled = false;
+                        prompt.focus();
+                        return;
+                    }
+
+                    const responseText = data.response || 'No response';
+                    history.push(['assistant', responseText]);
+                    typingBubble.textContent = '';
+                    typeTextIntoBubble(typingBubble, responseText);
+                } catch (error) {
+                    typingBubble.textContent = 'Error: ' + error.message;
+                    status.textContent = 'Error';
+                    history.push(['assistant', 'Error: ' + error.message]);
+                    sendBtn.disabled = false;
+                    prompt.focus();
+                }
+            }
+
+            sendBtn.addEventListener('click', sendMessage);
+            clearBtn.addEventListener('click', () => {
+                chat.innerHTML = '';
+                history.length = 0;
+                status.textContent = 'Ready';
+            });
+
+            prompt.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    sendMessage();
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """)
 
 
-# ============================================================
-# START SERVER
-# ============================================================
-
-def main():
-
-    print()
-    print("================================")
-    print("        NOVA AI SERVER")
-    print("================================")
-    print()
-    print(
-        f"Listening on 0.0.0.0:{PORT}"
-    )
-    print()
-    print(
-        "Endpoints:"
-    )
-    print(
-        "  GET  /"
-    )
-    print(
-        "  GET  /health"
-    )
-    print(
-        "  POST /chat"
-    )
-    print()
+@app.get("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "nova_loaded": NOVA is not None,
+        "model_path": resolve_model_path(MODEL_PATH),
+        "port": PORT,
+    })
 
 
-    server = ThreadingHTTPServer(
-        (
-            HOST,
-            PORT
-        ),
-        NovaRequestHandler
-    )
+def normalize_conversation(payload):
+    data = payload or {}
+    conversation = data.get("conversation")
+    if conversation is None:
+        message = data.get("message", "")
+        if not isinstance(message, str):
+            raise ValueError("Missing 'message' or 'conversation'")
+        conversation = [("user", message)]
 
+    if not isinstance(conversation, list):
+        raise ValueError("'conversation' must be a list")
+
+    cleaned = []
+    for item in conversation:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("Each conversation item must contain role and message")
+
+        role = str(item[0])
+        message = str(item[1])
+        if role not in ("user", "assistant"):
+            raise ValueError("Role must be 'user' or 'assistant'")
+        cleaned.append((role, message))
+
+    if not cleaned:
+        raise ValueError("Conversation is empty")
+
+    return cleaned
+
+
+@app.post("/api/chat")
+def api_chat():
+    if NOVA is None:
+        return jsonify({"error": "Nova AI model is not loaded."}), 503
 
     try:
+        conversation = normalize_conversation(request.get_json(silent=True))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
-        server.serve_forever()
+    try:
+        response = NOVA.chat(conversation)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
-    except KeyboardInterrupt:
+    image_match = re.search(r"\[IMAGE:\s*(.*?)\]", response, re.DOTALL)
+    if image_match:
+        prompt_text = image_match.group(1).strip()
+        return jsonify({
+            "response": response,
+            "type": "image",
+            "prompt": prompt_text,
+            "image_url": make_image_url(prompt_text),
+        })
 
-        print(
-            "\nStopping Nova AI server..."
-        )
-
-    finally:
-
-        server.server_close()
+    return jsonify({"response": response, "type": "text"})
 
 
 if __name__ == "__main__":
-    main()
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
